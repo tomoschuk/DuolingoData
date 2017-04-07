@@ -1,0 +1,330 @@
+---
+title: "Duolingo Language Difficulty"
+author: "Brendan Tomoschuk"
+date: "4/5/2017"
+output: html_document
+---
+##The questions
+
+
+
+I am a longtime user and fan of [Duolingo](www.duolingo.com), a platform for learning new languages free of charge. And as a PhD student researching language learning and bilingualism, I have long awaited the opportunity to get my hands on any of the data they accumulate. Well I finally have. Burr Settles, of the Duolingo team, published a [paper](http://burrsettles.com/pub/settles.acl16.pdf) in the ACL proceedings discussing spaced repetition in Duolingo data. With this publication they shared their code and data on github. So I'm going to play with it a bit! Here's what I want to know:
+
+
+1. Which languages are hardest to learn?  
+
+  + [The Foreign Services Institute has ranked the languages based on how long they should take to learn.](http://www.effectivelanguagelearning.com/language-guide/language-difficulty) If this holds for our data, German should be a little bit harder than our other languages (Spanish, French, Italian and Portugese).
+  
+2. Which kinds of words are hardest to learn?  
+
+  + I've always found verbs to be the most challenging because they, at least in the langauges listed here, involve more marking than other kinds of words (i.e. you have to worry about more and a wider variety of endings).
+  
+3. Can we build a model that predicts accuracy of a given word?
+
+[Spoil your appetite and skip to the answers.](#answers)
+
+##Clean the data
+
+So before doing anything else let's load some relevant libraries and take a peek at the data.
+```{r, message=FALSE}
+library(data.table)
+library(ggplot2)
+library(Rmisc)
+library(stringr)
+library(stringdist)
+library(lme4)
+library(SnowballC)
+
+
+#Data can be found here: https://github.com/duolingo/halflife-regression
+
+#fread is a faster means of loading a big dataset, which we know this will be
+data.raw = fread('bigset.csv')
+```
+
+And let's take a brief look at the data...
+
+```{r}
+head(data.raw)
+str(data.raw)
+```
+
+Ok, wow. We have almost 13 million datapoints from over 115 thousand users learning 6 languages, as well as information about every word learned. Let's look more at what's in this dataset.
+
+Each line of the dataset is a word for a given user, for a given session. So the first line is the word "lernt" (seen in the **lexeme_string**) for user u:f0 for some session of German. In this particular session they've seen the word twice (**session_seen**) and gotten it right twice (**session_correct**). Before this session they've seen the word 6 times (**history_seen**) and gotten it right 4 times (**history_correct**).
+
+The **lexeme_string** variable has a lot of juicy information. First we see the surface form, which is the word in question, as it appears. After the /, we see the lemma, which is the base form of the word (unchanged to note person or tense or anything like that). Then in the first set of <>, we have the part of speech, and following that we have a lot of information about how the word is modified - so lernt is a lexical verb, in the present tense, third person, singular (in that order).
+
+Because this data set is massive and R isn't super for such datasets, we need to clean up the data and add some variables to make it as memory and time efficient as possible.
+
+```{r}
+#Removing all lines with NA data and non-English learners for simplicity
+data.raw = data.raw[complete.cases(data.raw),]
+data.raw = data.raw[data.raw$ui_language == "en"]
+
+#Getting rid of variables that mean nothing to us
+data.raw$timestamp = NULL
+data.raw$lexeme_id = NULL
+
+```
+
+First, I want to find the total number of times a person has seen a word or gotten a word correct, across session. To do this I need to find the highest value for **history_seen**, (for each word and for each person) and remove all rows that aren't the max for each person and word. This will show us each person's last session for a given word. We will then add that current session information to the history information to calculate a total for each word. 
+
+```{r}
+#Create a temporary factor that includes both a user_id and a lexeme_string
+data.raw$temp = as.factor(paste(data.raw$user_id, data.raw$lexeme_string, sep = "_"))
+
+#Remove all rows that aren't the max value
+data.reduced = data.raw[data.raw[, .I[history_seen == max(history_seen)], by=temp]$V1]
+
+#Create total_variables
+data.reduced$total_seen = data.reduced$history_seen + data.reduced$session_seen
+data.reduced$total_correct = data.reduced$history_correct + data.reduced$session_correct
+
+#This one was especially fun to name
+data.reduced$total_recall = data.reduced$total_correct/data.reduced$total_seen
+
+```
+
+
+Next we'll aggregate over subjects. By averaging every subject's response to a **lexeme_string**, we significantly reduce the size of the dataset, having only an average value for each lexeme string produced. We lose some variability due to averaging, but the dataset is so big that shouldn't be a problem.
+
+```{r}
+
+data.reduced = data.frame(aggregate(cbind(total_seen,
+                                 total_correct,
+                                 total_recall)~
+                             lexeme_string+
+                               learning_language, data = data.reduced,mean))
+
+#make learning_language a factor
+data.reduced$learning_language = as.factor(data.reduced$learning_language)
+```
+
+### Add a lemma variable
+
+That makes our data MUCH more managable, reducing our dataset to about 1% the original data size. Now we'll add a lemma column. The **lexeme_string** contains the information about the word that we want to extract. While the first part, the surface form, isn't that important to us, the "lemma" is. It's the base word that we'll be working with. The lemma is the word built into the lexeme string after the / and before the part of speech noted with <. So we'll simply tell R to check every lexeme string, and extract the characters after the / and before the first <.
+
+```{r}
+#This removes all information before the lexeme
+data.reduced$lexeme_string = gsub("^.*?/","/",data.reduced$lexeme_string)
+
+
+
+data.reduced$lemma = substr(data.reduced$lexeme_string, 2, as.numeric(lapply(gregexpr('<',data.reduced$lexeme_string),head,1)) - 1)
+
+```
+
+###Add item and cognate status variables {#item}
+
+Now I want to add a column that contains all of the information in the same language. For example, it's better for analysis if I can represent the word *chien* as a vector containing the semantic information and the language - something like <dog, french> - so that when I compare it to *cane* - noted as <dog, italian> - I know they're the same item. For this I extracted all of the unique lemmas and fed them through Google Translate. I reupload that as a .csv here. (Using Google's API to directly get translation information isn't a free service, but translating a few thousand words in browser is...so again it's a slightly more time intensive solution than I'd prefer, but it gets the job done.)
+
+
+```{r}
+
+#CSV containing all of our translations.
+trans = read.csv('translations.csv', encoding = "UTF-8")
+
+
+#Add a column combining learning_language and lemma, so that we can match the two documents together
+data.reduced$ll_lemma = paste(data.reduced$learning_language, data.reduced$lemma, sep = "_")
+trans$ll_lemma = paste(trans$learning_language, trans$lemma, sep = "_")
+
+#We'll add the actual item column in a minute
+
+```
+
+Additionally, I think cognate status could impact learning. A cognate is a word that is the same, or very similar between two languages (like *animal* in Spanish and English). [We know that cognate improves word learning](https://scholar.google.com/citations?view_op=view_citation&hl=en&user=MeVlddUAAAAJ&citation_for_view=MeVlddUAAAAJ:Y0pCki6q_DkC), so I wanted to implement a simple measure of cognate status, using [levenshtien distance](https://en.wikipedia.org/wiki/Levenshtein_distance).
+
+```{r}
+#Cognate status
+## stringsim calcuates the minimal number of deletions, insertions, and substitutions that can change one word into another.
+trans$cognatestatus = stringsim(as.character(trans$item),as.character(trans$lemma))
+data.reduced$cognatestatus = with(trans, cognatestatus[match(data.reduced$ll_lemma,ll_lemma)])
+  
+#Here I trim the endings off the translations to make sure plural words are not considered different than singular words.
+##This is the simplest way to do that without manually editing all translations
+trans$item = wordStem(trans$item, language = "english")
+
+
+#Add item category
+data.reduced$item = with(trans, item[match(data.reduced$ll_lemma,ll_lemma)])
+
+data.reduced$ll_lemma = NULL
+```
+
+
+###Add a part of speech variable
+Now let's add a couple simple variables that might help us capture differences in data. I'd like to extract the part of speech of each word, located in the **lexeme_string**, found in the first set of <>.
+```{r}
+
+data.reduced$pos = substr(data.reduced$lexeme_string,
+                      as.numeric(lapply(gregexpr('<',data.reduced$lexeme_string),head,1)) + 1, as.numeric(lapply(gregexpr('>',data.reduced$lexeme_string),head,1)) - 1)
+
+
+```
+
+Now I'd like to simplify the parts of speech variable...It would be too overwhelming for me to compare every category to one another. Categories like nouns will have big Ns, but the verbs, adjectives and other category words are broken down into lots of subsections that I want to aggregate together. To do this I used the lexeme_reference.txt found on Duolingo's github and edited it to make simpler categories. All of the categories were distilled into Nouns, Verbs, Function words (like the, on, with etc.) and describer, which is a category I just made up to cover things like adjectives and adverbs.
+
+```{r}
+lexref = read.csv('lexeme_reference.csv')
+#Add simplePos based on the POS from the lexeme reference guide
+data.reduced$simplePos = with(lexref, Type[match(data.reduced$pos,pos)])
+
+
+data.reduced = data.reduced[complete.cases(data.reduced),]
+
+#Remove intricate part of speech variable
+data.reduced$pos = NULL
+
+#Remove "other"" items
+data.reduced = data.reduced[data.reduced$simplePos != "other",]
+
+```
+
+###Add Number of Modifiers variable
+Next, I want to know how complicated a word is. Surely a word with more modifiers should be more difficult (e.g. a basic noun should be easier to get correct than a basic noun that has a bunch of endings denoting female,plural,accusative case etc. (Yeah, I'm looking at you German.)) To do that I'll simply add a variable that counts the number of < characters, as each modifier adds a left bracket. While it's true that all **lexeme_string** values have at least one modifier, it shouldn't matter so long we consider this value only relatively.
+
+```{r}
+#Add number of modifiers
+data.reduced$NoMod = str_count(data.reduced$lexeme_string,pattern = "<")
+
+```
+
+Ok whew. We've reduced added and altered our data down to 16K observations of 13 variables. Now let's have some fun!
+
+##Look at the data
+So our first question was to see which languages are harder or easier. The simplest, easiest, grayest way to do that is like this:
+```{r}
+#create summary statistics table
+sumstat = summarySE(data.reduced, measurevar = "total_recall", groupvars = c("learning_language"))
+
+#Generate simple bar graph
+ggplot(sumstat, aes(x=learning_language, y=total_recall, fill = learning_language)) +
+  geom_bar(stat="identity", position=position_dodge(), size=.3, aes(fill = learning_language))
+
+```
+
+So they look pretty similar like this. There's a hint that Italian and Portugese are easier than the rest, and that French is the hardest.
+
+Fortunately we can take a more nuanced approach by using the variables that go into **total_recall**, namely **total_seen** and **total_correct**.
+
+```{r, warning= FALSE}
+ggplot(data.reduced, aes(x = total_seen, y=total_correct, color = learning_language))+ 
+  geom_point()+
+  geom_smooth(method = lm,aes(color = learning_language))+
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed")+
+  scale_x_continuous(limits = c(0,100))+
+  scale_y_continuous(limits = c(0,100))
+
+```
+
+Now we're cooking. First, note that the dotted line represent a perfect score. It means they've gotten the word right every time it has been shown. 
+Anyway, based on this linear regression, French is definitely the hardest language, insofar as it takes more instances of seeing a certain word before reaching the same number of correct productions as one of the other languages. For example, just by looking at the regression lines, we can see that for a word to be produced 30 times correctly in French, a user needs to have seen it ~60 times, but for 30 correct productions in German, a word needs to be seen ~40 times.
+
+Now our second question was about what *kinds* of words are harder or easier to learn. And for that we will use a nearly identical graph, but this time we separate by our simple parts of speech metric.
+
+```{r, warning = FALSE}
+ggplot(data.reduced, aes(x = total_seen, y=total_correct, color = simplePos))+ 
+  geom_point()+
+  geom_smooth(method = lm, aes(color = simplePos))+
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed")+
+  scale_x_continuous(limits = c(0,100))+
+  scale_y_continuous(limits = c(0,100))+
+  scale_color_brewer(palette = "Dark2")
+```
+
+Here we see a relatively simple pattern that verbs are most difficult to produce correctly, with nouns and describers coming second, and the function category being relatively easier. 
+
+I wonder if this varies between languages, since the french words seem to comprise most of the nouns and verbs that are harder. 
+
+```{r, warning = FALSE,fig.width=11,fig.height=4}
+ggplot(data.reduced, aes(x = total_seen, y=total_correct, color = learning_language, shape = simplePos))+ 
+  geom_point(aes(shape = simplePos))+
+  geom_smooth(method = lm,aes(color = learning_language))+
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed")+
+  scale_x_continuous(limits = c(0,80))+
+  scale_y_continuous(limits = c(0,80))+
+  facet_wrap(~learning_language, ncol = 5)
+```
+
+Well, well, well. Which one of these things is not like les autres? The French words seem to be entirely driving the differences seen from parts of speech. French nouns and verbs take much longer to get than other langauges!
+
+These graphs are especially interesting to me in comparison to the bar graph at the beginning. These graphs clearly show that French is behaving differently from the other languages, but in the bar graph the french users really don't do that poorly relative to the other languages. They were just a bit below the average. This makes me think that Duolingo knows French learners are going to take a little bit more time to pick things up and therefore prompt them to review more often. Although we know this is true from Duolingo themselves, let's let the data do the talking. 
+
+```{r}
+sumstat2 = summarySE(data.reduced, measurevar = "total_seen", groupvars = c("learning_language","simplePos"))
+ggplot(sumstat2, aes(x = simplePos, y=total_seen, fill = learning_language))+ 
+  geom_bar(stat="identity", position=position_dodge(),
+           size=.3)
+```
+
+The French course clearly presents words to their users more frequently (though German gives them a run for their money in describer and verb categories). More strikingly, though, Italian and Portugese seem to stick out. Words in those language aren't shown to users *nearly* as often as in other languages. The paper mentioned before talks about how duolingo works to optimize spaced repetition, and I think it's clear to see that they do a pretty decent job doing that! Different languages prompt reviews more or less frequently, but still come out to the same relatively high proficiency. French may be more difficult, but Duolingo prompts you to review it more when you need to practice.
+
+##Model building
+
+I'd like to see how well we can train a model to predict whether or not a user is going to get a word right. For that I'll use a linear mixed effects regression (LMER). Here is where our [item](#item) column comes into play. LMERs allow us to treat some variables as fixed (the ones we care about), but treat other items that we don't care about as random. In this case we will treat item as a random variable. The model will therefore consider that some words are harder than others, but won't misattribute that information to a language. Different language courses teach different words, and if French happens to teach harder words, we don't want the model to tell us that French is just harder, when it really has something to do with the item variable. 
+
+So we'll see how many times they've gotten a particular word right (**total_correct**), as a function of how often they've seen it (**total_seen**), which language the word is in (**language_learning**), which part of speech the word is (**simplePos**), the number of modifers it has (**NoMod**), and finally the cognate status (**cognatestatus**). I also include the interaction between part of speech and language learning since we saw that pattern arise in our graphs. If I were truly testing this for significance, I would include many more interactions. I'd also need to let my fixed effects vary within my random effects structure. However, for the purposes of this, I'd like to keep it simple.
+
+```{r}
+
+#Make item a factor
+data.reduced$item = as.factor(data.reduced$item)
+
+
+duo.lme = lmer(total_correct~
+                 total_seen +
+                 learning_language +
+                 simplePos +
+                 NoMod +
+                 cognatestatus +
+                 learning_language:simplePos +
+                 (1 |item), data = data.reduced)
+print(summary(duo.lme), correlation = FALSE)
+```
+
+Since an LMER doesn't give p values and should rely on model comparisons, we can look at the relative impact of each factor by looking at the estimates and t values. **Total_seen** obviously soaks up most of the variance, but **learning_language**, and **simplePos** have high t values, so they definitely contribute a bit. Likewise, we can see that within the interaction term, french verbs have one of the highest estimates and t values (second only to **total_seen**), so our model definitely captures that pretty well too.
+
+Just to be sure, let's do what we should always do for a significance test in an LMER: build a model that contains every effect EXCEPT the effect of interest, and use the anova function to compare the models and see if the effect of interest adds a significant amount of variance on top of the model with everything else in it.
+
+```{r}
+duo.base = lmer(total_correct~
+                 total_seen +
+                 learning_language +
+                 simplePos +
+                 NoMod +
+                 cognatestatus +
+                 (1 |item), data = data.reduced)
+
+anova(duo.base,duo.lme)
+
+```
+
+And it does! The p value for our chi-square test is very, very low. Cool. 
+
+
+##Answers {#answers}
+
+1. Which languages are hardest to learn?  
+
+  + We've learned that French takes the most tries to reach a certain level of proficiency for English speaking learners, not German as we predicted. And that this is true especially for verbs (and nouns to a slightly lesser extent). My next question would of course be: why do French nouns and verbs take more practice to reach proficiency? Do french learners simply lack a certain *Ils ne savent quoi*?. Likely not. French has a notoriously big gap between orthography and phonology (i.e. pronounced french and written french are super different and hard to master!), and since most Duolingo production practice is written, that may account for some of these words being harder. This dataset doesn't let us research questions about the different kinds of duolingo practice...but maybe one day!
+  
+2. Which kinds of words are hardest to learn?  
+
+  + One could say that nouns and verbs take longer to get than function words and describers, but that really only appears to be true for French, so, at least for Duolingo, there probably isn't anything fundamentally more difficult about nouns and verbs *across* languages.
+  
+3. Can we build a model that predicts accuracy of a given word?
+
+  + We can and we did! It helped us figure out that the nouns and verbs behave differently in different languages (namely French).
+
+
+###What's next?
+
++ The French data seem to split, where some words behave like the other languages and others (mostly nouns and verbs) follow their own pattern, but we don't capture those two clusters by any one variable yet. I'll bet different kinds of verbs, nouns and function words behave differently. We really didn't have the power to look at that here. Maybe we can one day, under different circumstances (namely with more computing power).
+
++ Speaking of - R is not great for datasets of these magnitudes. I considered a couple different work arounds, but ultimately the smartest one seemed to be aggregating the data and reducing the size of the file by ~99%. I'll next try to implement the solution in Python, using a distributed processing system so that I don't need to aggregate so much.
+
+
+
+[Home](http://acsweb.ucsd.edu/~btomosch/index.html)
